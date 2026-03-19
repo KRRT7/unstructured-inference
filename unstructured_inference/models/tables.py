@@ -27,6 +27,48 @@ from . import table_postprocess as postprocess
 DEFAULT_MODEL = "microsoft/table-transformer-structure-recognition"
 
 
+def _load_table_model_fp16(model_name: str, device: str) -> TableTransformerForObjectDetection:
+    """Load table transformer with pre-cached FP16 weights to avoid double-load.
+
+    HuggingFace from_pretrained(dtype=float16) loads FP32 weights first then converts,
+    creating 110 MiB FP32 + 110 MiB FP16 simultaneously. This function pre-converts to
+    FP16 safetensors on first load, then loads from cache — halving peak memory.
+    """
+    from huggingface_hub import hf_hub_download
+    from safetensors import safe_open
+    from safetensors.torch import load_file, save_file
+
+    # Get the original safetensors path and derive FP16 cache path
+    original_path = hf_hub_download(model_name, "model.safetensors")
+    fp16_path = original_path.replace("model.safetensors", "model_fp16.safetensors")
+
+    # Load model architecture on meta device (no memory for params)
+    config = TableTransformerForObjectDetection.config_class.from_pretrained(model_name)
+    with torch.device("meta"):
+        model = TableTransformerForObjectDetection(config)
+
+    # Convert to FP16 on first load, filtering keys not in model
+    if not Path(fp16_path).exists():
+        logger.info("Converting table transformer weights to FP16 (one-time)...")
+        model_keys = set(dict(model.named_parameters()).keys()) | set(
+            dict(model.named_buffers()).keys()
+        )
+        fp16_dict = {}
+        with safe_open(original_path, framework="pt") as f:
+            for key in f.keys():
+                if key in model_keys:
+                    fp16_dict[key] = f.get_tensor(key).to(torch.float16)
+        save_file(fp16_dict, fp16_path)
+        del fp16_dict
+
+    # Load pre-saved FP16 weights — no FP32 intermediate
+    state_dict = load_file(fp16_path)
+    model.load_state_dict(state_dict, assign=True)
+    del state_dict
+
+    return model.to(device)
+
+
 class UnstructuredTableTransformerModel(UnstructuredModel):
     """Unstructured model wrapper for table-transformer."""
 
@@ -101,13 +143,7 @@ class UnstructuredTableTransformerModel(UnstructuredModel):
             cached_current_verbosity = logging.get_verbosity()
             logging.set_verbosity_error()
 
-            # Load model WITHOUT device_map (prevents meta tensor errors)
-            self.model = TableTransformerForObjectDetection.from_pretrained(model)
-
-            # Explicit device placement with dtype
-            # NOTE: While nn.Module.to() modifies in-place, capturing return value is
-            # recommended best practice per PyTorch docs for consistency and clarity
-            self.model = self.model.to(self.device, dtype=torch.float32)
+            self.model = _load_table_model_fp16(model, self.device)
 
             logging.set_verbosity(cached_current_verbosity)
             self.model.eval()
@@ -131,7 +167,7 @@ class UnstructuredTableTransformerModel(UnstructuredModel):
             encoding = self.feature_extractor(
                 pad_image_with_background_color(x, pad_for_structure_detection),
                 return_tensors="pt",
-            ).to(self.device)
+            ).to(self.device, dtype=torch.float16)
             outputs_structure = self.model(**encoding)
             outputs_structure["pad_for_structure_detection"] = pad_for_structure_detection
             return outputs_structure
