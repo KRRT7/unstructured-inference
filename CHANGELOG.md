@@ -1,3 +1,8 @@
+## 1.5.3
+
+### Enhancement
+- Pre-convert table transformer weights to FP16 safetensors on first load to avoid HuggingFace double-load pattern (FP32 load + FP16 convert). Halves peak memory for table structure recognition model.
+
 ## 1.5.2
 
 ### Fix
